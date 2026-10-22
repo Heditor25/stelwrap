@@ -7,9 +7,13 @@ import {
   InvalidContractAddressError,
   ContractNotFoundError,
   ContractValidationError,
+  mapContractError,
 } from "./contractErrors";
 import { mintWrap as contractMintWrap, type MintWrapOptions, type TransactionObserver } from "../../src/services/contractBridge";
 import { useTransactionStore } from "../store/transactionStore";
+import { logger } from "./logger";
+
+const log = logger.child("walletKit");
 
 if (
   typeof process !== "undefined" &&
@@ -17,8 +21,8 @@ if (
   !process.env.NEXT_PUBLIC_CONTRACT_ADDRESS_TESTNET &&
   !process.env.NEXT_PUBLIC_CONTRACT_ADDRESS
 ) {
-  console.warn(
-    "⚠️ No contract address env set (NEXT_PUBLIC_CONTRACT_ADDRESS_MAINNET, NEXT_PUBLIC_CONTRACT_ADDRESS_TESTNET, or NEXT_PUBLIC_CONTRACT_ADDRESS). Using placeholder per network.",
+  log.warn(
+    "No contract address env set (NEXT_PUBLIC_CONTRACT_ADDRESS_MAINNET, NEXT_PUBLIC_CONTRACT_ADDRESS_TESTNET, or NEXT_PUBLIC_CONTRACT_ADDRESS). Using placeholder per network.",
   );
 }
 
@@ -227,8 +231,13 @@ export async function mintWrap(params: MintWrapParams): Promise<string> {
     }
     if (error instanceof Error) {
       useTransactionStore.getState().setTransactionState("failed");
-      useTransactionStore.getState().setTransactionError(error.message);
-      throw new Error(`Minting failed: ${error.message}`);
+      // Prefer friendly mapped copy when the error still carries a host Contract #code
+      const mapped = mapContractError(error);
+      const userMessage =
+        mapped.code !== "Unknown" ? mapped.userMessage : error.message;
+      log.error("mint failed", { code: mapped.code, raw: mapped.raw });
+      useTransactionStore.getState().setTransactionError(userMessage);
+      throw new Error(`Minting failed: ${userMessage}`);
     }
     const genericError = new Error("Minting failed: Unknown error occurred");
     useTransactionStore.getState().setTransactionState("failed");

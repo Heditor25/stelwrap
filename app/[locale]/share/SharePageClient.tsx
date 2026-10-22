@@ -1,25 +1,27 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useLocale, useTranslations } from "next-intl";
 import { motion, AnimatePresence } from "framer-motion";
-import { ExternalLink, Share2 } from "lucide-react";
+import { ExternalLink, Share2, Link2, Check } from "lucide-react";
 import { useSearchParams } from "next/navigation";
+import { useNativeShare } from "@/app/hooks/useNativeShare";
 import { mockData } from "@/app/data/mockData";
 import { GOLDEN_USER } from "@/src/data/mockData";
 import { ProgressIndicator } from "@/app/components/ProgressIndicator";
-import { MuteToggle } from "../components/MuteToggle";
-import { ShareCard } from "../components/ShareCard";
-import { ShareImageCard } from "../components/ShareImageCard";
-import { ShareImageCardStories } from "../components/ShareImageCardStories";
-import { useTheme, themeColors } from "../context/ThemeContext";
-import { useWrapStore } from "../store/wrapStore";
+import { MuteToggle } from "../../components/MuteToggle";
+import { ShareCard } from "../../components/ShareCard";
+import { ShareImageCard } from "../../components/ShareImageCard";
+import { ShareImageCardStories } from "../../components/ShareImageCardStories";
+import { useTheme, themeColors } from "../../context/ThemeContext";
+import { useWrapStore } from "../../store/wrapStore";
 import {
   XIcon,
   WhatsAppIcon,
   FacebookIcon,
   LinkedInIcon,
   TelegramIcon,
-} from "../components/SocialIcons";
+} from "../../components/SocialIcons";
 import { trackEvent } from "../../utils/plausible";
 import {
   buildSharePreviewSearchParams,
@@ -27,6 +29,13 @@ import {
   parseSharePreviewParams,
   type SharePreviewState,
 } from "@/app/utils/sharePreviewParams";
+import { getStellarExpertAccountUrl } from "@/app/utils/stellarExpert";
+import { isZeroActivityResult } from "@/app/utils/zeroActivity";
+import { ZeroActivityEmptyState } from "@/app/components/ZeroActivityEmptyState";
+import {
+  useReducedMotion,
+  reducedMotionTransition,
+} from "@/app/hooks/useReducedMotion";
 
 const SocialIcons = {
   X: XIcon,
@@ -38,14 +47,27 @@ const SocialIcons = {
 
 export default function SharePageClient() {
   const searchParams = useSearchParams();
+  const locale = useLocale();
+  const t = useTranslations("SharePage");
+  const cardT = useTranslations("ShareCard");
+  const cardLabels = {
+    stellarWrapped: cardT("stellarWrapped"),
+    totalTransactions: cardT("totalTransactions"),
+    persona: cardT("persona"),
+    topVibe: cardT("topVibe"),
+    scanToView: cardT("scanToView"),
+    scanToViewAlt: cardT("scanToViewAlt"),
+    noVibeData: cardT("noVibeData"),
+  };
   const [shareOpen, setShareOpen] = useState<boolean>(false);
-  const [shareUrl, setShareUrl] = useState<string>("");
   const [cardFormat, setCardFormat] = useState<"square" | "stories">("square");
   const shareMenuRef = useRef<HTMLDivElement | null>(null);
   const shareBtnRef = useRef<HTMLButtonElement | null>(null);
   const shareImageRef = useRef<HTMLDivElement>(null!);
   const { color } = useTheme();
+  const prefersReducedMotion = useReducedMotion();
   const { address: walletAddress, network, result } = useWrapStore();
+  const { isSupported: canNativeShare, share: nativeShare } = useNativeShare();
 
   const urlPreview = useMemo(
     () => parseSharePreviewParams(searchParams),
@@ -72,12 +94,8 @@ export default function SharePageClient() {
   const topVibe = displayPreview.topVibe;
   const vibePercentage = displayPreview.vibePercentage;
 
-  const stellarExpertUrl =
-    !isPublicPreview && walletAddress
-      ? network === "testnet"
-        ? `https://stellar.expert/explorer/testnet/account/${walletAddress}`
-        : `https://stellar.expert/explorer/public/account/${walletAddress}`
-      : null;
+  const stellarExpertUrl = !isPublicPreview && walletAddress ? getStellarExpertAccountUrl(walletAddress, network) : null;
+  const showZeroActivity = isZeroActivityResult(result);
 
   const [themeColor] = useState<string>(() => {
     if (typeof window === "undefined") return themeColors.green.primary;
@@ -92,39 +110,104 @@ export default function SharePageClient() {
     return computedColor || themeColors[color].primary;
   });
 
-  useEffect(() => {
-    if (typeof window === "undefined") return;
+  const shareUrl = useMemo(() => {
+    if (typeof window === "undefined") return "";
     const query = buildSharePreviewSearchParams(storePreview).toString();
     const path = `${window.location.pathname}?${query}`;
-    setShareUrl(`${window.location.origin}${path}`);
+    return `${window.location.origin}${path}`;
   }, [storePreview]);
+
+  const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState<string | null>(null);
+
+  const handleCopyLink = async () => {
+    const url = shareUrl || window.location.href;
+    setCopyError(null);
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      const textarea = document.createElement("textarea");
+      textarea.value = url;
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      document.execCommand("copy");
+      document.body.removeChild(textarea);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  const shareTitle = t("title");
+  const shareText = t("shareText", {
+    transactions,
+    persona,
+    vibePercentage,
+    topVibe,
+  });
+
+  /**
+   * Primary share button. Prefers the native share sheet when the browser
+   * supports it (mobile), and falls back to the social menu otherwise.
+   */
+  const handlePrimaryShare = async () => {
+    if (!canNativeShare) {
+      setShareOpen((open) => !open);
+      return;
+    }
+
+    trackEvent("share_clicked", { platform: "native" });
+
+    const outcome = await nativeShare({
+      title: shareTitle,
+      text: shareText,
+      url: window.location.href,
+    });
+
+    if (outcome === "shared") {
+      trackEvent("share_completed", { platform: "native" });
+      return;
+    }
+
+    if (outcome === "cancelled") {
+      // User dismissed the share sheet — expected, so no error surfaces.
+      trackEvent("share_cancelled", { platform: "native" });
+      return;
+    }
+
+    // Unsupported payload or a genuine failure: fall back to the social menu.
+    setShareOpen(true);
+  };
 
   const handleShare = (platform: string) => {
     trackEvent("share_clicked", { platform });
     const url = shareUrl || window.location.href;
-    const text = `Check out my Stellar Wrapped 2026! ${transactions} transactions, ${persona} persona, ${vibePercentage}% ${topVibe}! 🎉 #StellarWrapped`;
-    let shareUrl = "";
+    const text = shareText;
+    let platformShareUrl = "";
 
     switch (platform) {
       case "x":
-        shareUrl = `https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}&url=${encodeURIComponent(url)}`;
+        platformShareUrl = `https://twitter.com/intent/tweet?text=${encodeURIComponent(text)}&url=${encodeURIComponent(url)}`;
         break;
       case "whatsapp":
-        shareUrl = `https://wa.me/?text=${encodeURIComponent(text + " " + url)}`;
+        platformShareUrl = `https://wa.me/?text=${encodeURIComponent(text + " " + url)}`;
         break;
       case "facebook":
-        shareUrl = `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(url)}`;
+        platformShareUrl = `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(url)}`;
         break;
       case "linkedin":
-        shareUrl = `https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(url)}`;
+        platformShareUrl = `https://www.linkedin.com/sharing/share-offsite/?url=${encodeURIComponent(url)}`;
         break;
       case "telegram":
-        shareUrl = `https://t.me/share/url?url=${encodeURIComponent(url)}&text=${encodeURIComponent(text)}`;
+        platformShareUrl = `https://t.me/share/url?url=${encodeURIComponent(url)}&text=${encodeURIComponent(text)}`;
         break;
     }
 
-    if (shareUrl) {
-      window.open(shareUrl, "_blank", "width=600,height=500");
+    if (platformShareUrl) {
+      window.open(platformShareUrl, "_blank", "width=600,height=500");
     }
     setShareOpen(false);
   };
@@ -168,149 +251,180 @@ export default function SharePageClient() {
     }
   }, [shareOpen]);
 
+  const socialPlatforms = [
+    { id: "x", label: t("platforms.x"), Icon: SocialIcons.X },
+    { id: "whatsapp", label: t("platforms.whatsapp"), Icon: SocialIcons.WhatsApp },
+    { id: "facebook", label: t("platforms.facebook"), Icon: SocialIcons.Facebook },
+    { id: "linkedin", label: t("platforms.linkedin"), Icon: SocialIcons.LinkedIn },
+    { id: "telegram", label: t("platforms.telegram"), Icon: SocialIcons.Telegram },
+  ];
+
   return (
-    <div className="relative w-full h-screen overflow-hidden">
-      <div
-        ref={shareImageRef}
-        className="absolute"
-        style={{ left: "-9999px", top: 0 }}
-      >
-        {cardFormat === "stories" ? (
-          <ShareImageCardStories themeColor={themeColor} archetypeImage={GOLDEN_USER.archetype.image} shareUrl={shareUrl} />
-        ) : (
-          <ShareImageCard themeColor={themeColor} archetypeImage={GOLDEN_USER.archetype.image} shareUrl={shareUrl} />
-        )}
-      </div>
-
-      <ShareCard
-        username={username}
-        transactions={transactions}
-        persona={persona}
-        topVibe={topVibe}
-        vibePercentage={vibePercentage}
-        shareImageRef={shareImageRef}
-        themeColor={themeColor}
-        cardFormat={cardFormat}
-        onFormatChange={setCardFormat}
-      />
-
-      <ProgressIndicator currentStep={6} totalSteps={6} showNext={false} />
-
-      <motion.div
-        className="absolute top-6 right-6 md:top-8 md:right-8 z-30"
-        initial={{ opacity: 0, x: 20 }}
-        animate={{ opacity: 1, x: 0 }}
-        transition={{ delay: 0.2 }}
-      >
-        <MuteToggle />
-      </motion.div>
-
-      {stellarExpertUrl && (
-        <motion.a
-          href={stellarExpertUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="absolute bottom-6 right-6 md:bottom-8 md:right-8 z-30 flex items-center gap-2 px-4 py-3 rounded-xl backdrop-blur-xl border border-white/10 text-white/60 hover:text-white/90 hover:border-white/30 transition-all text-xs font-medium"
-          style={{ backgroundColor: "rgba(0, 0, 0, 0.5)" }}
-          initial={{ opacity: 0, x: 20 }}
-          animate={{ opacity: 1, x: 0 }}
-          transition={{ delay: 0.4 }}
-        >
-          <ExternalLink className="w-3.5 h-3.5" />
-          View full history on Stellar.expert
-        </motion.a>
-      )}
-
-      <div className="absolute bottom-6 left-6 z-30">
-        <div className="relative">
-          <AnimatePresence>
-            {shareOpen && (
-              <motion.div
-                ref={shareMenuRef}
-                initial={{ opacity: 0, y: 10, scale: 0.95 }}
-                animate={{ opacity: 1, y: 0, scale: 1 }}
-                exit={{ opacity: 0, y: 10, scale: 0.95 }}
-                transition={{ duration: 0.2 }}
-                className="absolute bottom-18 left-0 w-[200px] h-[350px] bg-[#060607] border border-[#232325] rounded-2xl shadow-2xl p-2 z-50 flex flex-col items-center justify-center gap-2"
-                style={{ boxShadow: "0 10px 40px rgba(0,0,0,0.8)" }}
-              >
-                <button
-                  onClick={() => handleShare("x")}
-                  className="flex cursor-pointer items-center pl-4 w-42 h-15 gap-3 p-2 rounded-xl bg-[#0F0F10] hover:bg-[#1a1a1c] transition-colors group"
-                >
-                  <div className="h-10 w-10 flex items-center justify-center rounded-full bg-black border border-white/10">
-                    <SocialIcons.X />
-                  </div>
-                  <span className="font-bold text-white tracking-wide">x</span>
-                </button>
-
-                <button
-                  onClick={() => handleShare("whatsapp")}
-                  className="flex cursor-pointer items-center pl-4 w-42 h-15 gap-3 p-2 rounded-xl bg-[#0F0F10] hover:bg-[#1a1a1c] transition-colors group"
-                >
-                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[#25D366]">
-                    <SocialIcons.WhatsApp />
-                  </div>
-                  <span className="font-bold text-white tracking-wide">
-                    WhatsApp
-                  </span>
-                </button>
-
-                <button
-                  onClick={() => handleShare("facebook")}
-                  className="flex items-center cursor-pointer pl-4 gap-3 p-2 w-42 h-15 rounded-xl bg-[#0F0F10] hover:bg-[#1a1a1c] transition-colors"
-                >
-                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[#1877F2]">
-                    <SocialIcons.Facebook />
-                  </div>
-                  <span className="font-bold text-white tracking-wide">
-                    Facebook
-                  </span>
-                </button>
-
-                <button
-                  onClick={() => handleShare("linkedin")}
-                  className="flex items-center pl-4 cursor-pointer gap-3 p-2 w-42 h-15 rounded-xl bg-[#0F0F10] hover:bg-[#1a1a1c] transition-colors"
-                >
-                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[#0077B5]">
-                    <SocialIcons.LinkedIn />
-                  </div>
-                  <span className="font-bold text-white tracking-wide">
-                    LinkedIn
-                  </span>
-                </button>
-
-                <button
-                  onClick={() => handleShare("telegram")}
-                  className="flex items-center cursor-pointer pl-4 gap-3 p-2 w-42 h-15 rounded-xl bg-[#0F0F10] hover:bg-[#1a1a1c] transition-colors"
-                >
-                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[#229ED9]">
-                    <SocialIcons.Telegram />
-                  </div>
-                  <span className="font-bold text-white tracking-wide">
-                    Telegram
-                  </span>
-                </button>
-              </motion.div>
-            )}
-          </AnimatePresence>
-
-          <button
-            ref={shareBtnRef}
-            aria-expanded={shareOpen}
-            aria-haspopup="menu"
-            aria-label="Toggle share menu"
-            onClick={() => setShareOpen(!shareOpen)}
-            className="flex h-12 w-12 sm:h-16 sm:w-16 items-center justify-center rounded-full border border-white/10 bg-black/60 text-white backdrop-blur-md transition hover:bg-white/5"
-          >
-            <motion.div
-              animate={{ rotate: shareOpen ? 50 : 0 }}
-              transition={{ type: "spring", stiffness: 260, damping: 20 }}
-            >
-              <Share2 className="h-5 w-5 sm:h-7 sm:w-7 cursor-pointer" />
-            </motion.div>
-          </button>
+    <div className="min-h-screen bg-black text-white">
+      <div className="mx-auto max-w-4xl px-4 py-10">
+        <div className="mb-6 flex items-center justify-between">
+          <div>
+            <h1 className="text-3xl font-bold">{t("title")}</h1>
+            <p className="mt-2 text-white/70">{t("subtitle")}</p>
+          </div>
+          <MuteToggle />
         </div>
+
+        {showZeroActivity ? (
+          <ZeroActivityEmptyState />
+        ) : (
+          <div className="mt-8 space-y-6">
+            <div ref={shareImageRef}>
+              {cardFormat === "square" ? (
+                <ShareImageCard
+                  username={username}
+                  transactions={transactions}
+                  persona={persona}
+                  topVibe={topVibe}
+                  vibePercentage={vibePercentage}
+                  themeColor={themeColor}
+                  locale={locale}
+                  archetypeImage={GOLDEN_USER.archetype.image}
+                  shareUrl={shareUrl}
+                  labels={cardLabels}
+                />
+              ) : (
+                <ShareImageCardStories
+                  username={username}
+                  transactions={transactions}
+                  persona={persona}
+                  topVibe={topVibe}
+                  vibePercentage={vibePercentage}
+                  themeColor={themeColor}
+                  locale={locale}
+                  archetypeImage={GOLDEN_USER.archetype.image}
+                  shareUrl={shareUrl}
+                  labels={cardLabels}
+                />
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                onClick={() => setCardFormat("square")}
+                aria-pressed={cardFormat === "square"}
+                className={`rounded-full px-4 py-1.5 text-sm font-medium transition ${
+                  cardFormat === "square"
+                    ? "bg-white text-black"
+                    : "border border-white/20 text-white hover:bg-white/10"
+                }`}
+              >
+                {t("squareFormat")}
+              </button>
+              <button
+                type="button"
+                onClick={() => setCardFormat("stories")}
+                aria-pressed={cardFormat === "stories"}
+                className={`rounded-full px-4 py-1.5 text-sm font-medium transition ${
+                  cardFormat === "stories"
+                    ? "bg-white text-black"
+                    : "border border-white/20 text-white hover:bg-white/10"
+                }`}
+              >
+                {t("storiesFormat")}
+              </button>
+            </div>
+
+            <div className="relative flex flex-wrap items-center gap-3">
+              <button
+                ref={shareBtnRef}
+                type="button"
+                onClick={handlePrimaryShare}
+                aria-haspopup="menu"
+                aria-expanded={shareOpen}
+                className="inline-flex items-center gap-2 rounded-full bg-white px-5 py-2.5 font-semibold text-black transition hover:bg-white/90"
+              >
+                <Share2 className="h-4 w-4" aria-hidden="true" />
+                {t("share")}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleCopyLink}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    handleCopyLink();
+                  }
+                }}
+                className="inline-flex items-center gap-2 rounded-full border border-white/20 px-5 py-2.5 font-semibold text-white transition hover:bg-white/10"
+              >
+                {copied ? (
+                  <Check className="h-4 w-4" aria-hidden="true" />
+                ) : (
+                  <Link2 className="h-4 w-4" aria-hidden="true" />
+                )}
+                {copied ? t("copied") : t("copyLink")}
+              </button>
+
+              {stellarExpertUrl && (
+                <a
+                  href={stellarExpertUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-2 rounded-full border border-white/20 px-5 py-2.5 font-semibold text-white transition hover:bg-white/10"
+                >
+                  <ExternalLink className="h-4 w-4" aria-hidden="true" />
+                  {t("viewOnStellarExpert")}
+                </a>
+              )}
+
+              <AnimatePresence>
+                {shareOpen && (
+                  <motion.div
+                    ref={shareMenuRef}
+                    role="menu"
+                    initial={prefersReducedMotion ? false : { opacity: 0, y: 8 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={prefersReducedMotion ? { opacity: 0 } : { opacity: 0, y: 8 }}
+                    transition={reducedMotionTransition(prefersReducedMotion)}
+                    className="absolute left-0 top-full z-20 mt-2 flex flex-wrap gap-2 rounded-2xl border border-white/10 bg-white/10 p-3 backdrop-blur"
+                  >
+                    {socialPlatforms.map(({ id, label, Icon }) => (
+                      <button
+                        key={id}
+                        type="button"
+                        role="menuitem"
+                        onClick={() => handleShare(id)}
+                        aria-label={label}
+                        className="inline-flex items-center gap-2 rounded-full border border-white/10 px-4 py-2 text-sm font-medium transition hover:bg-white/10"
+                      >
+                        <Icon className="h-4 w-4" aria-hidden="true" />
+                        {label}
+                      </button>
+                    ))}
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+
+            {copyError && (
+              <p role="alert" className="text-sm text-red-400">
+                {copyError}
+              </p>
+            )}
+
+            <ShareCard
+              username={username}
+              transactions={transactions}
+              persona={persona}
+              topVibe={topVibe}
+              vibePercentage={vibePercentage}
+              themeColor={themeColor}
+              labels={cardLabels}
+            />
+
+            <div className="pt-2">
+              <ProgressIndicator />
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

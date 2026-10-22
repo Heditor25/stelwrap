@@ -18,20 +18,41 @@ interface ShareImageCardData {
   vibes?: ShareImageCardVibe[];
 }
 
+interface ShareCardLabels {
+  stellarWrapped: string;
+  totalTransactions: string;
+  persona: string;
+  topVibe: string;
+  scanToView: string;
+  scanToViewAlt: string;
+  noVibeData: string;
+}
+
 interface ShareImageCardProps {
   themeColor: string;
   archetypeImage?: string | null; // e.g. '/archetypes/wizard.png'; null hides the image fallback.
   data?: ShareImageCardData;
-  archetypeImage?: string;
   shareUrl?: string;
+  locale?: string;
+  labels?: ShareCardLabels;
 }
 
+export function ShareImageCard({
+  themeColor,
+  archetypeImage,
+  data,
+  shareUrl,
+  locale = "en",
+  labels = { stellarWrapped: "STELLAR WRAPPED 2026", totalTransactions: "Total Transactions", persona: "Persona", topVibe: "Top Vibe", scanToView: "SCAN TO VIEW", scanToViewAlt: "Scan to view", noVibeData: "No vibe data" },
+}: ShareImageCardProps) {
+  const { persona, transactions, username, vibes = [] } = data ?? mockData;
   const topVibe = vibes[0];
+  // Derive image from persona name if not explicitly provided: "The Wizard" -> /archetypes/wizard.png
   const resolvedArchetypeImage =
     archetypeImage === undefined
       ? `/archetypes/${persona.toLowerCase().replace(/^the\s+/, "").replace(/\s+/g, "-")}.png`
       : archetypeImage;
-  const formattedTransactions = new Intl.NumberFormat("en-US").format(transactions);
+  const formattedTransactions = new Intl.NumberFormat(locale).format(transactions);
 
   const qrCodeUrl = shareUrl
     ? `https://api.qrserver.com/v1/create-qr-code/?size=120x120&data=${encodeURIComponent(shareUrl)}`
@@ -103,7 +124,7 @@ interface ShareImageCardProps {
                 marginTop: "-15px",
               }}
             >
-              STELLAR WRAPPED 2026
+              {labels.stellarWrapped}
             </span>
           </div>
           <h2
@@ -143,7 +164,7 @@ interface ShareImageCardProps {
                 color: "rgba(255, 255, 255, 0.6)",
               }}
             >
-              Total Transactions
+              {labels.totalTransactions}
             </p>
             <p
               style={{
@@ -176,7 +197,7 @@ interface ShareImageCardProps {
                 marginBottom: "8px",
               }}
             >
-              Persona
+              {labels.persona}
             </p>
             <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
               {resolvedArchetypeImage ? (
@@ -230,7 +251,7 @@ interface ShareImageCardProps {
                 marginBottom: "8px",
               }}
             >
-              Top Vibe
+              {labels.topVibe}
             </p>
             <p
               style={{
@@ -239,7 +260,7 @@ interface ShareImageCardProps {
                 color: "white",
               }}
             >
-              {topVibe ? `${topVibe.percentage}% ${topVibe.label}` : "No vibe data"}
+              {topVibe ? `${topVibe.percentage}% ${topVibe.label}` : labels.noVibeData}
             </p>
           </div>
         </div>
@@ -276,7 +297,7 @@ interface ShareImageCardProps {
               <>
                 <img
                   src={qrCodeUrl}
-                  alt="Scan to view"
+                  alt={labels.scanToViewAlt}
                   style={{
                     width: "120px",
                     height: "120px",
@@ -293,7 +314,7 @@ interface ShareImageCardProps {
                     letterSpacing: "0.05em",
                   }}
                 >
-                  SCAN TO VIEW
+                  {labels.scanToView}
                 </div>
               </>
             )}

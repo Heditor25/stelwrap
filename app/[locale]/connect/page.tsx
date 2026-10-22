@@ -1,31 +1,53 @@
 "use client";
 
-import { useState, useRef, useEffect, KeyboardEvent } from "react";
-import { useRouter } from "next/navigation";
+import { useState, useRef, useEffect, KeyboardEvent, ChangeEvent, FormEvent } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { ArrowLeft, Wallet, Copy, CheckCircle, XCircle, ChevronRight, QrCode } from "lucide-react";
-import { useWrapStore } from "@/app/store/wrapStore";
-import { useTransactionStore } from "@/app/store/transactionStore";
-import { useMultiTimeframeStore } from "@/app/store/multiTimeframeStore";
-import { useSound, SOUND_NAMES } from "@/app/hooks/useSound";
-import { useOnlineStatus } from "@/app/hooks/useOnlineStatus";
-import { useStellarAddressValidation } from "@/app/hooks/useStellarAddressValidation";
-import { ProgressIndicator } from "@/app/components/ProgressIndicator";
-import { MuteToggle } from "@/app/[locale]/components/MuteToggle";
+import { ArrowLeft, Wallet, CheckCircle, XCircle, Copy, ChevronRight, QrCode } from "lucide-react";
+import { logger } from "@/app/utils/logger";
+import { Horizon } from "stellar-sdk";
+import { useTranslations } from "next-intl";
+import { useWrapStore } from "../../store/wrapStore";
+import { useTransactionStore } from "../../store/transactionStore";
+import { useMultiTimeframeStore } from "../../store/multiTimeframeStore";
+import { useWalletStore } from "../../store/walletStore";
+import { useSound } from "../../hooks/useSound";
+import { useOnlineStatus } from "../../hooks/useOnlineStatus";
+import { useStellarAddressValidation } from "../../../src/hooks/useStellarAddressValidation";
+import { ProgressIndicator } from "../../components/ProgressIndicator";
+import { MuteToggle } from "../../components/MuteToggle";
+import { ConnectWalletButton } from "../../components/ConnectWalletButton";
 import {
   connectFreighter,
+  getFreighterNetwork,
   connectAlbedo,
   connectXBull,
   isXBullInstalled,
   NetworkMismatchError,
-} from "@/app/utils/walletConnect";
-import { connectWalletConnect } from "@/app/utils/walletKit";
+} from "../../utils/walletConnect";
+import { connectWalletConnect } from "../../utils/walletConnectManager";
+import { getHorizonServer } from "../../utils/stellarClient";
+import { SOUND_NAMES } from "../../utils/soundManager";
+import { useRouter } from "next/navigation";
+import {
+  DEMO_STELLAR_ADDRESS,
+  markDemoMode,
+  clearDemoMode,
+} from "@/app/data/demoAccount";
+
+const log = logger.child("connect");
 
 export default function ConnectPage() {
   const router = useRouter();
+  const t = useTranslations("ConnectPage");
   const { setAddress, setError, setStatus, network, reset } = useWrapStore();
   const { resetTransaction } = useTransactionStore();
   const { reset: resetMultiTimeframe } = useMultiTimeframeStore();
+  const {
+    connect: connectWalletSession,
+    address: connectedAddress,
+    provider: connectedProvider,
+    isConnected,
+  } = useWalletStore();
   const { playSound } = useSound();
   const isOnline = useOnlineStatus();
 
@@ -49,6 +71,17 @@ export default function ConnectPage() {
     actual: string;
   } | null>(null);
 
+  // Last-used address (remembered across sessions so returning users can
+  // reconnect in one tap instead of re-typing their address).
+  const [lastUsedAddress, setLastUsedAddress] = useState<string | null>(null);
+
+  // Account preview shown after a manual address is entered and validated,
+  // before the user commits to continuing into the wrap flow.
+  const [showPreview, setShowPreview] = useState(false);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewBalance, setPreviewBalance] = useState<string>("0");
+  const [previewTxCount, setPreviewTxCount] = useState<number>(0);
+
   // Refs for focus management
   const mainContentRef = useRef<HTMLDivElement>(null);
   const backButtonRef = useRef<HTMLButtonElement>(null);
@@ -59,6 +92,9 @@ export default function ConnectPage() {
 
   // Load last-used address from localStorage on mount
   useEffect(() => {
+    // Returning to /connect always leaves demo mode; handleDemoMode re-arms it.
+    clearDemoMode();
+
     const saved = localStorage.getItem("lastUsedStellarAddress");
     if (saved) {
       setLastUsedAddress(saved);
@@ -69,11 +105,101 @@ export default function ConnectPage() {
     }
   }, []);
 
+  // Freighter does not provide a reliable cross-browser network-change event.
+  // Poll its read-only network details while connected so a switch in the
+  // extension is surfaced persistently and cannot be bypassed at Continue.
+  useEffect(() => {
+    if (!isConnected || connectedProvider !== "freighter" || !connectedAddress) {
+      return;
+    }
+
+    let active = true;
+    const checkNetwork = async () => {
+      const actual = await getFreighterNetwork();
+      if (!active || actual === null) return;
+
+      if (actual !== network) {
+        setNetworkMismatch({ expected: network, actual });
+      } else {
+        setNetworkMismatch(null);
+      }
+    };
+
+    void checkNetwork();
+    const interval = window.setInterval(checkNetwork, 3_000);
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [connectedAddress, connectedProvider, isConnected, network]);
+
+  /**
+   * Persist the most recently used wallet address to localStorage so it can
+   * be offered as a one-tap reconnect option on a future visit.
+   */
+  const saveAddressToLocalStorage = (address: string) => {
+    try {
+      localStorage.setItem("lastUsedStellarAddress", address);
+      setLastUsedAddress(address);
+    } catch {
+      // localStorage can throw in private-browsing / storage-full states;
+      // failing to remember the address is non-fatal, so we swallow it.
+    }
+  };
+
+  /**
+   * Clear the remembered last-used address (e.g. when the user explicitly
+   * chooses "Use a different wallet").
+   */
+  const clearSavedAddress = () => {
+    try {
+      localStorage.removeItem("lastUsedStellarAddress");
+    } catch {
+      // non-fatal
+    }
+    setLastUsedAddress(null);
+    useWalletStore.getState().disconnect();
+  };
+
+  /**
+   * Fetch a lightweight account preview (native XLM balance and a recent
+   * transaction count) for the given address, to show the user what they're
+   * about to wrap before they commit to continuing.
+   *
+   * Transaction count is derived from a single bounded page (most recent
+   * 200 transactions) rather than the true lifetime total, since Horizon
+   * does not expose a cheap total-count endpoint. This is an approximation
+   * ("recent activity"), not the account's full history size.
+   */
+  const fetchAccountPreview = async (address: string) => {
+    setShowPreview(true);
+    setPreviewLoading(true);
+    try {
+      const server = getHorizonServer(network === "testnet" ? "testnet" : "mainnet");
+      const account = await server.loadAccount(address);
+      const nativeBalance = account.balances.find(
+        (b): b is Horizon.HorizonApi.BalanceLineNative => b.asset_type === "native",
+      );
+      setPreviewBalance(nativeBalance ? nativeBalance.balance : "0");
+
+      const txPage = await server
+        .transactions()
+        .forAccount(address)
+        .limit(200)
+        .call();
+      setPreviewTxCount(txPage.records.length);
+    } catch (error) {
+      log.error("Failed to fetch account preview:", error);
+      setPreviewBalance("0");
+      setPreviewTxCount(0);
+    } finally {
+      setPreviewLoading(false);
+    }
   };
 
   const handleFreighterConnect = async () => {
     if (!isOnline) {
-      setLocalError("Wallet connect is unavailable offline.");
+      setLocalError(t("errors.offlineConnect"));
       return;
     }
 
@@ -89,6 +215,7 @@ export default function ConnectPage() {
     try {
       const publicKey = await connectFreighter(network);
       setAddress(publicKey);
+      connectWalletSession(publicKey, "freighter", network);
       saveAddressToLocalStorage(publicKey);
       setError(null);
       playSound(SOUND_NAMES.SLIDE_WHOOSH);
@@ -100,7 +227,7 @@ export default function ConnectPage() {
         setStatus("idle");
       } else {
         const msg =
-          error instanceof Error ? error.message : "Failed to connect wallet";
+          error instanceof Error ? error.message : t("errors.walletConnectFailed");
         setError(msg);
         setLocalError(msg);
         setStatus("error");
@@ -112,7 +239,7 @@ export default function ConnectPage() {
 
   const handleAlbedoConnect = async () => {
     if (!isOnline) {
-      setLocalError("Wallet connect is unavailable offline.");
+      setLocalError(t("errors.offlineConnect"));
       return;
     }
 
@@ -127,30 +254,30 @@ export default function ConnectPage() {
     try {
       const publicKey = await connectAlbedo(network);
       setAddress(publicKey);
+      connectWalletSession(publicKey, "albedo", network);
       saveAddressToLocalStorage(publicKey);
       setError(null);
       playSound(SOUND_NAMES.SLIDE_WHOOSH);
       await fetchAccountPreview(publicKey);
     } catch (error: unknown) {
-      const errorMessage =
-        error instanceof Error ? error.message : "Failed to connect wallet";
-      setError(errorMessage);
-      setLocalError(errorMessage);
+      const errMsg =
+        error instanceof Error ? error.message : t("errors.walletConnectFailed");
+      setError(errMsg);
+      setLocalError(errMsg);
       setStatus("error");
     } finally {
       setIsConnecting(false);
     }
   };
 
-
   const handleXBullConnect = async () => {
     if (!isOnline) {
-      setLocalError("Wallet connect is unavailable offline.");
+      setLocalError(t("errors.offlineConnect"));
       return;
     }
 
     if (!isXBullInstalled()) {
-      setLocalError("xBull wallet not found. Please install it from the Chrome Web Store.");
+      setLocalError(t("errors.xbullNotFoundShort"));
       window.open(
         "https://chromewebstore.google.com/detail/xbull-wallet/klpfklhikflhefnndkhiokkdbndlfhno",
         "_blank"
@@ -169,14 +296,15 @@ export default function ConnectPage() {
     try {
       const publicKey = await connectXBull(network);
       setAddress(publicKey);
+      connectWalletSession(publicKey, "xbull", network);
       setError(null);
       playSound(SOUND_NAMES.SLIDE_WHOOSH);
       router.push("/loading");
     } catch (error: unknown) {
-      const errorMessage =
-        error instanceof Error ? error.message : "Failed to connect wallet";
-      setError(errorMessage);
-      setLocalError(errorMessage);
+      const errMsg =
+        error instanceof Error ? error.message : t("errors.walletConnectFailed");
+      setError(errMsg);
+      setLocalError(errMsg);
       setStatus("error");
     } finally {
       setIsConnecting(false);
@@ -185,7 +313,7 @@ export default function ConnectPage() {
 
   const handleWalletConnectConnect = async () => {
     if (!isOnline) {
-      setLocalError("Wallet connect is unavailable offline.");
+      setLocalError(t("errors.offlineConnect"));
       return;
     }
 
@@ -200,37 +328,43 @@ export default function ConnectPage() {
     try {
       const publicKey = await connectWalletConnect(network);
       setAddress(publicKey);
+      connectWalletSession(publicKey, "walletconnect", network);
       setError(null);
       playSound(SOUND_NAMES.SLIDE_WHOOSH);
       router.push("/loading");
     } catch (error: unknown) {
-      const errorMessage =
-        error instanceof Error ? error.message : "Failed to connect wallet";
-      setError(errorMessage);
-      setLocalError(errorMessage);
+      const errMsg =
+        error instanceof Error ? error.message : t("errors.walletConnectFailed");
+      setError(errMsg);
+      setLocalError(errMsg);
       setStatus("error");
     } finally {
       setIsConnecting(false);
     }
   };
 
-  const handleManualSubmit = (e?: React.FormEvent) => {
+  const handleManualSubmit = (e?: FormEvent<HTMLFormElement>) => {
     if (e) e.preventDefault();
 
     if (!isOnline) {
-      setLocalError("Indexing is unavailable offline.");
+      setLocalError(t("errors.offlineIndexing"));
       return;
     }
 
     if (!walletAddress.trim()) {
-      setLocalError("Please enter a wallet address");
+      setLocalError(t("errors.emptyAddress"));
       return;
     }
 
     // Validate Stellar address format
+    if (validationState === 'validating') {
+      setLocalError(t("errors.validatingWait"));
+      return;
+    }
+
     if (!isValid) {
-      setLocalError("Invalid wallet address. Please wait for validation.");
-      setError("Invalid wallet address");
+      setLocalError(t("errors.invalidAddress"));
+      setError(t("errors.invalidAddressShort"));
       return;
     }
 
@@ -241,16 +375,20 @@ export default function ConnectPage() {
 
     const trimmedAddress = walletAddress.trim();
     setAddress(trimmedAddress);
+    setStatus("loading");
+    setError(null);
+    connectWalletSession(trimmedAddress, "manual", network);
     saveAddressToLocalStorage(trimmedAddress);
     playSound(SOUND_NAMES.SLIDE_WHOOSH);
     fetchAccountPreview(walletAddress.trim());
   };
 
   const handleContinue = () => {
+    if (networkMismatch) return;
     router.push("/loading");
   };
 
-  const handleAddressChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleAddressChange = (e: ChangeEvent<HTMLInputElement>) => {
     handleRawAddressChange(e.target.value);
     setLocalError(null);
     setError(null);
@@ -267,7 +405,10 @@ export default function ConnectPage() {
         addressInputRef.current.focus();
       }
     } catch {
-      setError("Failed to paste from clipboard");
+      const pasteError = t("errors.clipboardFailed");
+      setLocalError(pasteError);
+      setError(pasteError);
+      addressInputRef.current?.focus();
     }
   };
 
@@ -277,15 +418,17 @@ export default function ConnectPage() {
 
   const handleDemoMode = () => {
     if (!isOnline) {
-      setLocalError("Demo indexing is unavailable offline.");
+      setLocalError(t("errors.demoOffline"));
       return;
     }
 
-    const demoAddress = "GDEMOADDRESSFORSTELLARWRAPDEMOPURPOSES12345678";
-    handleRawAddressChange(demoAddress);
+    // Demo mode is mock-only; the flag makes the loading screen skip Horizon.
+    markDemoMode();
+    handleRawAddressChange(DEMO_STELLAR_ADDRESS);
     setTimeout(() => {
-      setAddress(demoAddress);
+      setAddress(DEMO_STELLAR_ADDRESS);
       setStatus("loading");
+      connectWalletSession(DEMO_STELLAR_ADDRESS, "demo", network);
       playSound(SOUND_NAMES.SLIDE_WHOOSH);
       router.push("/loading");
     }, 100);
@@ -307,7 +450,8 @@ export default function ConnectPage() {
     if (
       (e.key === "Enter" || e.key === " ") &&
       !isConnecting &&
-      walletAddress.trim()
+      walletAddress.trim() &&
+      isValid
     ) {
       e.preventDefault();
       handleConnect();
@@ -327,7 +471,6 @@ export default function ConnectPage() {
       handleAlbedoConnect();
     }
   };
-
 
   const handleXBullKeyDown = (e: KeyboardEvent) => {
     if ((e.key === "Enter" || e.key === " ") && !isConnecting) {
@@ -358,7 +501,7 @@ export default function ConnectPage() {
   };
 
   const handleAddressKeyDown = (e: KeyboardEvent) => {
-    if (e.key === "Enter" && walletAddress.trim()) {
+    if (e.key === "Enter" && walletAddress.trim() && isValid) {
       e.preventDefault();
       handleManualSubmit();
     }
@@ -375,12 +518,12 @@ export default function ConnectPage() {
       e.preventDefault();
       onBack();
     }
-    // Tab behavior is left un-intercepted intentionally. 
+    // Tab behavior is left un-intercepted intentionally.
     // This allows the focus to escape into the browser chrome (e.g. URL bar),
     // which is required for full-page accessibility compliance.
   };
 
-  const errorId = localError ? "address-error" : undefined;
+  const errorId = errorMessage || localError ? "address-error" : undefined;
 
   return (
     <main
@@ -392,11 +535,11 @@ export default function ConnectPage() {
       {/* Progress Indicator */}
       <ProgressIndicator currentStep={2} totalSteps={6} showNext={false} />
 
-      {/* Background elements */}
-      <div className="absolute inset-0 bg-linear-to-br from-black via-black to-black opacity-60" />
+      {/* Background elements (decorative — hidden from assistive tech) */}
+      <div aria-hidden="true" className="absolute inset-0 bg-linear-to-br from-black via-black to-black opacity-60" />
 
-      {/* Animated grid background */}
-      <div className="absolute inset-0 opacity-20">
+      {/* Animated grid background (decorative — hidden from assistive tech) */}
+      <div aria-hidden="true" className="absolute inset-0 opacity-20">
         <motion.div
           className="w-full h-full"
           style={{
@@ -415,8 +558,9 @@ export default function ConnectPage() {
         />
       </div>
 
-      {/* Glowing orbs */}
+      {/* Glowing orbs (decorative — hidden from assistive tech) */}
       <motion.div
+        aria-hidden="true"
         className="absolute w-96 h-96 rounded-full blur-[120px]"
         style={{ backgroundColor: "rgba(var(--color-theme-primary-rgb), 0.3)" }}
         animate={{
@@ -445,7 +589,7 @@ export default function ConnectPage() {
           whileHover={{ scale: 1.05 }}
           whileTap={{ scale: 0.95 }}
           tabIndex={0}
-          aria-label="Go back to previous page"
+          aria-label={t("backAria")}
           role="button"
         >
           <div
@@ -457,7 +601,7 @@ export default function ConnectPage() {
               aria-hidden="true"
             />
             <span className="text-sm font-black text-white/80 group-hover:text-white transition-colors hidden sm:inline">
-              BACK
+              {t("back")}
             </span>
           </div>
         </motion.button>
@@ -528,10 +672,10 @@ export default function ConnectPage() {
               WebkitTextFillColor: "transparent",
             }}
           >
-            CONNECT WALLET
+            {t("title")}
           </h1>
           <p className="text-base sm:text-lg md:text-xl font-bold text-white/70 leading-relaxed">
-            Enter your Stellar wallet address to unwrap your 2026 journey
+            {t("subtitle")}
           </p>
         </motion.div>
 
@@ -549,6 +693,7 @@ export default function ConnectPage() {
                 resetTransaction();
                 resetMultiTimeframe();
                 setAddress(lastUsedAddress);
+                connectWalletSession(lastUsedAddress, "manual", network);
                 playSound(SOUND_NAMES.SLIDE_WHOOSH);
                 router.push("/loading");
               }}
@@ -559,7 +704,7 @@ export default function ConnectPage() {
               whileHover={{ scale: 1.02 }}
               whileTap={{ scale: 0.98 }}
               tabIndex={0}
-              aria-label={`Continue as ${lastUsedAddress.slice(0, 4)}...${lastUsedAddress.slice(-4)}`}
+              aria-label={t("continueAs", { shortAddress: `${lastUsedAddress.slice(0, 4)}...${lastUsedAddress.slice(-4)}` })}
               role="button"
             >
               <CheckCircle
@@ -568,16 +713,17 @@ export default function ConnectPage() {
                 aria-hidden="true"
               />
               <span className="text-sm sm:text-base">
-                Continue as {lastUsedAddress.slice(0, 4)}...{lastUsedAddress.slice(-4)}
+                {t("continueAs", { shortAddress: `${lastUsedAddress.slice(0, 4)}...${lastUsedAddress.slice(-4)}` })}
               </span>
             </motion.button>
             <button
+              type="button"
               onClick={clearSavedAddress}
               className="w-full mt-2 text-xs sm:text-sm text-white/50 hover:text-white/70 transition-colors font-medium"
               tabIndex={0}
-              aria-label="Use a different wallet"
+              aria-label={t("useDifferentWallet")}
             >
-              Use a different wallet
+              {t("useDifferentWallet")}
             </button>
           </motion.div>
         )}
@@ -613,7 +759,7 @@ export default function ConnectPage() {
               htmlFor="wallet-address"
               className="block text-sm font-black text-white/70 mb-3 tracking-wider"
             >
-              STELLAR ADDRESS
+              {t("stellarAddressLabel")}
             </label>
 
             <div className="relative mb-6">
@@ -624,7 +770,7 @@ export default function ConnectPage() {
                 value={walletAddress}
                 onChange={handleAddressChange}
                 onKeyDown={handleAddressKeyDown}
-                placeholder="Paste your Stellar address here"
+                placeholder={t("addressPlaceholder")}
                 className="w-full px-5 py-4 rounded-xl font-mono text-sm sm:text-base border-2 transition-all duration-200 focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
                 style={{
                   backgroundColor: "rgba(0, 0, 0, 0.5)",
@@ -634,11 +780,10 @@ export default function ConnectPage() {
                   color: "white",
                 }}
                 tabIndex={0}
-                aria-label="Stellar wallet address input"
+                aria-label={t("addressInputAria")}
                 aria-required="true"
                 aria-invalid={!!localError}
                 aria-describedby={errorId}
-                aria-errormessage={errorId}
                 autoComplete="off"
               />
 
@@ -649,7 +794,7 @@ export default function ConnectPage() {
                 whileHover={{ scale: 1.1 }}
                 whileTap={{ scale: 0.9 }}
                 tabIndex={0}
-                aria-label="Paste from clipboard"
+                aria-label={t("pasteAria")}
                 role="button"
               >
                 <Copy
@@ -668,7 +813,11 @@ export default function ConnectPage() {
                     exit={{ opacity: 0, scale: 0.8 }}
                     className="absolute right-12 top-1/2 -translate-y-1/2 pr-2 border-r border-white/20"
                   >
-                    <div className="w-5 h-5 border-2 border-theme-primary border-t-transparent rounded-full animate-spin" />
+                    <div
+                      role="status"
+                      aria-label="Validating address"
+                      className="w-5 h-5 border-2 border-theme-primary border-t-transparent rounded-full animate-spin"
+                    />
                   </motion.div>
                 ) : validationState === "valid" ? (
                   <motion.div
@@ -682,6 +831,7 @@ export default function ConnectPage() {
                       className="w-5 h-5 text-green-500"
                       aria-hidden="true"
                     />
+                    <span className="sr-only">Address valid</span>
                   </motion.div>
                 ) : validationState === "invalid" ||
                   validationState === "invalid-format" ||
@@ -699,6 +849,7 @@ export default function ConnectPage() {
                       className="w-5 h-5 text-red-500"
                       aria-hidden="true"
                     />
+                    <span className="sr-only">Address invalid</span>
                   </motion.div>
                 ) : null}
               </AnimatePresence>
@@ -708,6 +859,8 @@ export default function ConnectPage() {
             <AnimatePresence mode="popLayout">
               {validationState === "validating" && (
                 <motion.div
+                  role="status"
+                  aria-live="polite"
                   initial={{ opacity: 0, y: -10 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -10 }}
@@ -715,12 +868,14 @@ export default function ConnectPage() {
                 >
                   <div className="flex items-center justify-center gap-2">
                     <div className="w-4 h-4 border-2 border-yellow-500 border-t-transparent rounded-full animate-spin" />
-                    Checking account...
+                    {t("checkingAccount")}
                   </div>
                 </motion.div>
               )}
               {validationState === "indexing" && (
                 <motion.div
+                  role="status"
+                  aria-live="polite"
                   initial={{ opacity: 0, y: -10 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -10 }}
@@ -728,7 +883,7 @@ export default function ConnectPage() {
                 >
                   <div className="flex items-center justify-center gap-2">
                     <div className="w-4 h-4 border-2 border-theme-primary border-t-transparent rounded-full animate-spin" />
-                    Indexing transactions...
+                    {t("indexingTransactions")}
                   </div>
                 </motion.div>
               )}
@@ -751,9 +906,22 @@ export default function ConnectPage() {
                   initial={{ opacity: 0, y: -10 }}
                   animate={{ opacity: 1, y: 0 }}
                   exit={{ opacity: 0, y: -10 }}
+                  id="address-error"
+                  role="alert"
+                  aria-live="assertive"
                   className="mb-6 p-4 bg-red-500/10 border-2 border-red-500/50 rounded-xl text-red-400 text-sm text-center font-medium"
                 >
                   ⚠️ {localError}
+                  {localError.includes("Freighter") && localError.includes("installed") && (
+                    <a
+                      href="https://www.freighter.app/"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="ml-2 underline font-bold"
+                    >
+                      {t("freighterInstallLink")}
+                    </a>
+                  )}
                 </motion.div>
               )}
               {/* ── Network mismatch prompt ───────────────────────────── */}
@@ -765,21 +933,16 @@ export default function ConnectPage() {
                   exit={{ opacity: 0, y: -10 }}
                   className="mb-6 p-4 bg-yellow-500/10 border-2 border-yellow-500/50 rounded-xl text-yellow-300 text-sm font-medium"
                 >
-                  <p className="font-bold mb-1">⚠️ Wallet network mismatch</p>
+                  <p className="font-bold mb-1">{t("networkMismatchTitle")}</p>
                   <p className="text-yellow-400/80 text-xs mb-3">
-                    Freighter is connected to{" "}
-                    <span className="font-bold text-yellow-300">
-                      {networkMismatch.actual}
-                    </span>
-                    , but this app is set to{" "}
-                    <span className="font-bold text-yellow-300">
-                      {networkMismatch.expected}
-                    </span>
-                    . Please switch your Freighter wallet to{" "}
-                    <span className="font-bold text-yellow-300">
-                      {networkMismatch.expected}
-                    </span>{" "}
-                    and try again.
+                    {t.rich("networkMismatchDescription", {
+                      actual: (chunks) => (
+                        <span className="font-bold text-yellow-300">{chunks}</span>
+                      ),
+                      expected: (chunks) => (
+                        <span className="font-bold text-yellow-300">{chunks}</span>
+                      ),
+                    })}
                   </p>
                   <button
                     data-testid="network-mismatch-retry"
@@ -789,7 +952,7 @@ export default function ConnectPage() {
                     }}
                     className="w-full px-4 py-2 rounded-lg bg-yellow-500/20 border border-yellow-500/50 text-yellow-200 font-bold text-xs hover:bg-yellow-500/30 transition-colors focus:outline-none focus:ring-2 focus:ring-yellow-400"
                   >
-                    I&apos;ve switched — try again
+                    {t("networkMismatchRetry")}
                   </button>
                 </motion.div>
               )}
@@ -800,13 +963,13 @@ export default function ConnectPage() {
                   exit={{ opacity: 0, y: -10 }}
                   className="mb-6 p-4 bg-yellow-500/10 border-2 border-yellow-500/50 rounded-xl text-yellow-400 text-sm text-center font-medium"
                 >
-                  You&apos;re offline — wallet connect and indexing are disabled.
+                  {t("offlineNotice")}
                 </motion.div>
               )}
             </AnimatePresence>
 
-            <AnimatePresence mode="wait">
-              {showPreview && (
+            <AnimatePresence mode="wait" initial={false}>
+              {showPreview ? (
                 <motion.div
                   key="preview"
                   initial={{ opacity: 0, y: 10 }}
@@ -814,140 +977,157 @@ export default function ConnectPage() {
                   exit={{ opacity: 0, y: -10 }}
                   className="mb-6 p-6 bg-theme-primary/10 border-2 border-theme-primary/50 rounded-xl"
                 >
-                  <h2 className="text-sm font-bold text-white/80 mb-4 tracking-wide">ACCOUNT SUMMARY</h2>
+                  <h2 className="text-sm font-bold text-white/80 mb-4 tracking-wide">
+                    {t("accountSummary.title")}
+                  </h2>
                   <div className="space-y-3">
                     <div className="flex justify-between items-center">
-                      <span className="text-white/60 text-sm">Network</span>
-                      <span className="text-white font-bold">{network === "testnet" ? "Testnet" : "Mainnet"}</span>
+                      <span className="text-white/60 text-sm">{t("accountSummary.network")}</span>
+                      <span className="text-white font-bold">
+                        {network === "testnet" ? t("accountSummary.testnet") : t("accountSummary.mainnet")}
+                      </span>
                     </div>
                     {previewLoading ? (
                       <>
                         <div className="flex justify-between items-center">
-                          <span className="text-white/60 text-sm">Balance</span>
+                          <span className="text-white/60 text-sm">{t("accountSummary.balance")}</span>
                           <div className="w-20 h-5 bg-white/10 rounded animate-pulse" />
                         </div>
                         <div className="flex justify-between items-center">
-                          <span className="text-white/60 text-sm">Recent Transactions</span>
+                          <span className="text-white/60 text-sm">{t("accountSummary.recentTransactions")}</span>
                           <div className="w-20 h-5 bg-white/10 rounded animate-pulse" />
                         </div>
                       </>
                     ) : (
                       <>
                         <div className="flex justify-between items-center">
-                          <span className="text-white/60 text-sm">XLM Balance</span>
+                          <span className="text-white/60 text-sm">{t("accountSummary.xlmBalance")}</span>
                           <span className="text-white font-bold">{previewBalance} XLM</span>
                         </div>
                         <div className="flex justify-between items-center">
-                          <span className="text-white/60 text-sm">Total Operations</span>
+                          <span className="text-white/60 text-sm">{t("accountSummary.totalOperations")}</span>
                           <span className="text-white font-bold">{previewTxCount}</span>
                         </div>
                       </>
                     )}
                   </div>
                   <motion.button
+                    type="button"
                     onClick={handleContinue}
+                    disabled={Boolean(networkMismatch)}
                     className="w-full mt-4 px-6 py-3 rounded-xl font-bold text-black bg-theme-primary hover:bg-theme-primary/90 transition-colors flex items-center justify-center gap-2 focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
                     whileHover={{ scale: 1.02 }}
                     whileTap={{ scale: 0.98 }}
                   >
-                    <span>CONTINUE</span>
+                    <span>{t("accountSummary.continue")}</span>
                     <ChevronRight className="w-4 h-4" />
                   </motion.button>
                 </motion.div>
-              )}
-            </AnimatePresence>
-
-            {!showPreview && (
-              <motion.button
-                ref={connectButtonRef}
-                onClick={handleConnect}
-              onKeyDown={handleConnectKeyDown}
-              disabled={!isOnline || !walletAddress.trim() || isConnecting || !isValid}
-              className="w-full relative group disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none"
-              whileHover={{
-                scale: !isOnline || !walletAddress.trim() || isConnecting || !isValid ? 1 : 1.02,
-              }}
-              whileTap={{
-                scale: !isOnline || !walletAddress.trim() || isConnecting || !isValid ? 1 : 0.98,
-              }}
-              tabIndex={0}
-              aria-label={
-                !isOnline
-                  ? "Indexing unavailable offline"
-                  : isConnecting
-                    ? "Connecting wallet"
-                    : "Start wrapping process"
-              }
-              aria-disabled={!isOnline || !walletAddress.trim() || isConnecting || !isValid}
-              role="button"
-            >
-              <motion.div
-                className="absolute -inset-1 rounded-xl blur-lg"
-                style={{
-                  backgroundColor: "rgba(var(--color-theme-primary-rgb), 0.4)",
-                }}
-                animate={{
-                  opacity: [0.5, 0.8, 0.5],
-                }}
-                transition={{
-                  duration: 2,
-                  repeat: Infinity,
-                }}
-              />
-
-              <div
-                className="relative px-8 py-5 rounded-xl font-black text-lg sm:text-xl tracking-tight transition-all duration-200 flex items-center justify-center gap-3 focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
-                style={{
-                  backgroundColor: isConnecting
-                    ? "rgba(var(--color-theme-primary-rgb), 0.5)"
-                    : "var(--color-theme-primary)",
-                  color: "#000000",
-                  cursor:
+              ) : (
+                <motion.button
+                  key="manual-connect"
+                  ref={connectButtonRef}
+                  type="button"
+                  onClick={handleConnect}
+                  onKeyDown={handleConnectKeyDown}
+                  disabled={
                     !isOnline || !walletAddress.trim() || isConnecting || !isValid
-                      ? "not-allowed"
-                      : "pointer",
-                }}
-              >
-                {!isOnline ? (
-                  "OFFLINE"
-                ) : isConnecting ? (
-                  <>
-                    <div className="w-5 h-5 border-2 border-black border-t-transparent rounded-full animate-spin" />
-                    <span>CONNECTING...</span>
-                  </>
-                ) : (
-                  "START WRAPPING"
-                )}
-              </div>
-            </motion.button>
-            )}
+                  }
+                  className="w-full relative group disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none"
+                  whileHover={{
+                    scale:
+                      !isOnline || !walletAddress.trim() || isConnecting || !isValid
+                        ? 1
+                        : 1.02,
+                  }}
+                  whileTap={{
+                    scale:
+                      !isOnline || !walletAddress.trim() || isConnecting || !isValid
+                        ? 1
+                        : 0.98,
+                  }}
+                  tabIndex={0}
+                  aria-label={
+                    !isOnline
+                      ? t("offlineAria")
+                      : isConnecting
+                        ? t("connectingAria")
+                        : t("startWrappingAria")
+                  }
+                  aria-disabled={
+                    !isOnline || !walletAddress.trim() || isConnecting || !isValid
+                  }
+                  role="button"
+                >
+                  <motion.div
+                    aria-hidden="true"
+                    className="absolute -inset-1 rounded-xl blur-lg"
+                    style={{
+                      backgroundColor: "rgba(var(--color-theme-primary-rgb), 0.4)",
+                    }}
+                    animate={{
+                      opacity: [0.5, 0.8, 0.5],
+                    }}
+                    transition={{
+                      duration: 2,
+                      repeat: Infinity,
+                    }}
+                  />
+
+                  <div
+                    className="relative px-8 py-5 rounded-xl font-black text-lg sm:text-xl tracking-tight transition-all duration-200 flex items-center justify-center gap-3 focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
+                    style={{
+                      backgroundColor: isConnecting
+                        ? "rgba(var(--color-theme-primary-rgb), 0.5)"
+                        : "var(--color-theme-primary)",
+                      color: "#000000",
+                      cursor:
+                        !isOnline || !walletAddress.trim() || isConnecting || !isValid
+                          ? "not-allowed"
+                          : "pointer",
+                    }}
+                  >
+                    {!isOnline ? (
+                      t("offline")
+                    ) : isConnecting ? (
+                      <>
+                        <div className="w-5 h-5 border-2 border-black border-t-transparent rounded-full animate-spin" />
+                        <span>{t("connecting")}</span>
+                      </>
+                    ) : (
+                      t("startWrapping")
+                    )}
+                  </div>
+                </motion.button>
+              )}
             </AnimatePresence>
 
             {/* Wallet Connect Options */}
             <div className="mt-6 pt-6 border-t border-white/10 space-y-3">
               <p className="text-center text-sm font-medium text-white/50 mb-4">
-                or connect with
+                {t("orConnectWith")}
               </p>
               <motion.button
                 ref={freighterButtonRef}
+                type="button"
                 onClick={handleFreighterConnect}
                 onKeyDown={handleFreighterKeyDown}
                 disabled={!isOnline || isConnecting}
-                className="w-full px-6 py-4 bg-transparent border-2 rounded-xl font-bold text-white/70 hover:text-white transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
+                className="w-full px-6 py-4 bg-transparent border-2 rounded-xl font-bold text-white/70 hover:text-white hover:border-theme-primary/60 transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
                 style={{
                   borderColor: "rgba(var(--color-theme-primary-rgb), 0.3)",
                 }}
                 whileHover={{ scale: !isOnline || isConnecting ? 1 : 1.02 }}
                 whileTap={{ scale: !isOnline || isConnecting ? 1 : 0.98 }}
                 tabIndex={0}
-                aria-label="Connect with Freighter wallet"
+                aria-label={t("freighterButtonAria")}
                 aria-disabled={!isOnline || isConnecting}
                 role="button"
               >
                 {isConnecting ? (
                   <>
                     <div className="w-5 h-5 border-2 border-white/70 border-t-transparent rounded-full animate-spin" />
-                    <span>Connecting...</span>
+                    <span>{t("connecting")}</span>
                   </>
                 ) : (
                   <>
@@ -956,30 +1136,31 @@ export default function ConnectPage() {
                       style={{ color: "var(--color-theme-primary)" }}
                       aria-hidden="true"
                     />
-                    <span>Connect with Freighter</span>
+                    <span>{t("freighterButton")}</span>
                   </>
                 )}
               </motion.button>
 
               <motion.button
+                type="button"
                 onClick={handleAlbedoConnect}
                 onKeyDown={handleAlbedoKeyDown}
                 disabled={!isOnline || isConnecting}
-                className="w-full px-6 py-4 bg-transparent border-2 rounded-xl font-bold text-white/70 hover:text-white transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
+                className="w-full px-6 py-4 bg-transparent border-2 rounded-xl font-bold text-white/70 hover:text-white hover:border-theme-primary/60 transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
                 style={{
                   borderColor: "rgba(var(--color-theme-primary-rgb), 0.3)",
                 }}
                 whileHover={{ scale: !isOnline || isConnecting ? 1 : 1.02 }}
                 whileTap={{ scale: !isOnline || isConnecting ? 1 : 0.98 }}
                 tabIndex={0}
-                aria-label="Connect with Albedo wallet"
+                aria-label={t("albedoButtonAria")}
                 aria-disabled={!isOnline || isConnecting}
                 role="button"
               >
                 {isConnecting ? (
                   <>
                     <div className="w-5 h-5 border-2 border-white/70 border-t-transparent rounded-full animate-spin" />
-                    <span>Connecting...</span>
+                    <span>{t("connecting")}</span>
                   </>
                 ) : (
                   <>
@@ -988,30 +1169,31 @@ export default function ConnectPage() {
                       style={{ color: "var(--color-theme-primary)" }}
                       aria-hidden="true"
                     />
-                    <span>Connect with Albedo</span>
+                    <span>{t("albedoButton")}</span>
                   </>
                 )}
               </motion.button>
 
               <motion.button
+                type="button"
                 onClick={handleXBullConnect}
                 onKeyDown={handleXBullKeyDown}
                 disabled={!isOnline || isConnecting}
-                className="w-full px-6 py-4 bg-transparent border-2 rounded-xl font-bold text-white/70 hover:text-white transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
+                className="w-full px-6 py-4 bg-transparent border-2 rounded-xl font-bold text-white/70 hover:text-white hover:border-theme-primary/60 transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
                 style={{
                   borderColor: "rgba(var(--color-theme-primary-rgb), 0.3)",
                 }}
                 whileHover={{ scale: !isOnline || isConnecting ? 1 : 1.02 }}
                 whileTap={{ scale: !isOnline || isConnecting ? 1 : 0.98 }}
                 tabIndex={0}
-                aria-label="Connect with xBull wallet"
+                aria-label={t("xbullButtonAria")}
                 aria-disabled={!isOnline || isConnecting}
                 role="button"
               >
                 {isConnecting ? (
                   <>
                     <div className="w-5 h-5 border-2 border-white/70 border-t-transparent rounded-full animate-spin" />
-                    <span>Connecting...</span>
+                    <span>{t("connecting")}</span>
                   </>
                 ) : (
                   <>
@@ -1020,30 +1202,31 @@ export default function ConnectPage() {
                       style={{ color: "var(--color-theme-primary)" }}
                       aria-hidden="true"
                     />
-                    <span>Connect with xBull</span>
+                    <span>{t("xbullButton")}</span>
                   </>
                 )}
               </motion.button>
 
               <motion.button
+                type="button"
                 onClick={handleWalletConnectConnect}
                 onKeyDown={handleWalletConnectKeyDown}
                 disabled={!isOnline || isConnecting}
-                className="w-full px-6 py-4 bg-transparent border-2 rounded-xl font-bold text-white/70 hover:text-white transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
+                className="w-full px-6 py-4 bg-transparent border-2 rounded-xl font-bold text-white/70 hover:text-white hover:border-theme-primary/60 transition-all flex items-center justify-center gap-3 disabled:opacity-50 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black"
                 style={{
                   borderColor: "rgba(var(--color-theme-primary-rgb), 0.3)",
                 }}
                 whileHover={{ scale: !isOnline || isConnecting ? 1 : 1.02 }}
                 whileTap={{ scale: !isOnline || isConnecting ? 1 : 0.98 }}
                 tabIndex={0}
-                aria-label="Connect with WalletConnect mobile wallets"
+                aria-label={t("walletConnectButtonAria")}
                 aria-disabled={!isOnline || isConnecting}
                 role="button"
               >
                 {isConnecting ? (
                   <>
                     <div className="w-5 h-5 border-2 border-white/70 border-t-transparent rounded-full animate-spin" />
-                    <span>Connecting...</span>
+                    <span>{t("connecting")}</span>
                   </>
                 ) : (
                   <>
@@ -1052,7 +1235,7 @@ export default function ConnectPage() {
                       style={{ color: "var(--color-theme-primary)" }}
                       aria-hidden="true"
                     />
-                    <span>Connect with WalletConnect</span>
+                    <span>{t("walletConnectButton")}</span>
                   </>
                 )}
               </motion.button>
@@ -1060,36 +1243,37 @@ export default function ConnectPage() {
 
             <div className="mt-6 pt-6 border-t border-white/10">
               <p className="text-xs sm:text-sm text-white/50 text-center mb-3">
-                Don&apos;t have a Stellar wallet?{" "}
+                {t("noWalletPrompt")}{" "}
                 <a
                   href="https://stellar.org/wallets"
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="font-bold hover:text-white/80 transition-colors focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black focus:rounded"
+                  className="font-bold hover:opacity-80 transition-opacity focus:outline-none focus-visible:ring-2 focus-visible:ring-theme-primary focus-visible:ring-offset-2 focus-visible:ring-offset-black focus-visible:rounded"
                   style={{ color: "var(--color-theme-primary)" }}
                   tabIndex={0}
-                  aria-label="Learn how to get a Stellar wallet (opens in new window)"
+                  aria-label={t("getOneHereAria")}
                 >
-                  Get one here
+                  {t("getOneHere")}
                 </a>
               </p>
               <motion.button
                 ref={demoButtonRef}
+                type="button"
                 onClick={handleDemoMode}
                 onKeyDown={handleDemoKeyDown}
-                className="w-full text-xs sm:text-sm font-bold text-white/40 hover:text-white/60 transition-colors focus:outline-none focus:ring-2 focus:ring-theme-primary focus:ring-offset-2 focus:ring-offset-black focus:rounded"
+                className="w-full text-xs sm:text-sm font-bold text-white/60 hover:text-white/80 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-theme-primary focus-visible:ring-offset-2 focus-visible:ring-offset-black focus-visible:rounded"
                 whileHover={{ scale: 1.02 }}
                 whileTap={{ scale: 0.98 }}
                 tabIndex={0}
-                aria-label="Try demo mode"
+                aria-label={t("tryDemoModeAria")}
                 role="button"
               >
-                Or click here to try demo mode →
+                {t("tryDemoMode")}
               </motion.button>
             </div>
           </div>
         </motion.div>
       </div>
-    </div>
+    </main>
   );
 }

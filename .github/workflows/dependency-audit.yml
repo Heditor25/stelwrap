@@ -1,0 +1,27 @@
+name: Dependency Audit
+
+on:
+  pull_request:
+    branches:
+      - "**"
+    paths:
+      - "package.json"
+      - "pnpm-lock.yaml"
+  schedule:
+    # Every Monday at 09:00 UTC
+    - cron: "0 9 * * 1"
+  workflow_dispatch: {}
+
+jobs:
+  audit:
+    name: pnpm audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup
+        uses: ./.github/actions/setup
+
+      - name: Run dependency audit
+        run: pnpm audit --audit-level=high

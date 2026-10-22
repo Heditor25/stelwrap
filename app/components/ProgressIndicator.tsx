@@ -1,9 +1,9 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { Home } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useState, useEffect, KeyboardEvent } from "react";
+import { useState, useEffect, lazy, Suspense, KeyboardEvent } from "react";
+import { Home, ArrowRight } from "lucide-react";
 import { useSound } from "../hooks/useSound";
 import { SOUND_NAMES } from "../utils/soundManager";
 
@@ -13,6 +13,7 @@ interface ProgressIndicatorProps {
   onNext?: () => void;
   showNext?: boolean;
   routes?: string[]; // Optional array of routes for each step (1-indexed)
+  "data-testid"?: string;
 }
 
 // Default route mapping based on the app flow
@@ -40,6 +41,7 @@ export function ProgressIndicator({
   onNext,
   showNext = false,
   routes,
+  "data-testid": dataTestid,
 }: ProgressIndicatorProps) {
   const router = useRouter();
   const routeMap = routes || DEFAULT_ROUTES;
@@ -137,7 +139,7 @@ export function ProgressIndicator({
   };
 
   return (
-    <>
+    <div data-testid={dataTestid}>
       {/* Home button */}
       <motion.button
         onClick={() => router.push("/")}
@@ -157,9 +159,9 @@ export function ProgressIndicator({
           style={{ backgroundColor: "rgba(0, 0, 0, 0.5)" }}
         >
           <Home
-            className="w-4 h-4 md:w-5 md:h-5 text-white/80 group-hover:text-white transition-colors"
-            aria-hidden="true"
-          />
+              className="w-4 h-4 md:w-5 md:h-5 text-white/80 group-hover:text-white transition-colors"
+              aria-hidden="true"
+            />
           <span className="text-xs md:text-sm font-black text-white/80 group-hover:text-white transition-colors hidden sm:inline">
             HOME
           </span>
@@ -296,20 +298,11 @@ export function ProgressIndicator({
                 borderColor: "rgba(255, 255, 255, 0.3)",
               }}
             >
-              <svg
-                className="w-6 h-6 md:w-7 md:h-7"
-                viewBox="0 0 24 24"
-                fill="none"
-                aria-hidden="true"
-              >
-                <path
-                  d="M9 18l6-6-6-6"
-                  stroke="white"
-                  strokeWidth="2.5"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
+              <ArrowRight
+                  className="w-6 h-6 md:w-7 md:h-7 text-white"
+                  strokeWidth={2.5}
+                  aria-hidden="true"
                 />
-              </svg>
             </div>
           </div>
         </motion.button>
@@ -318,6 +311,8 @@ export function ProgressIndicator({
       <div className="sr-only" aria-live="polite" aria-atomic="true">
         {`${currentStepLabel}. Step ${currentStep} of ${totalSteps}.`}
       </div>
-    </>
+</div>
   );
 }
+
+export default ProgressIndicator;

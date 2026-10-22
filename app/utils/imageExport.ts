@@ -9,45 +9,10 @@
  * @returns Promise that resolves when download is triggered
  * @throws Error if canvas generation or download fails
  */
-export async function downloadShareImage(element: HTMLElement): Promise<void> {
-  // Dynamic import: html2canvas is only loaded when this function is called.
-  const html2canvas = (await import("html2canvas")).default;
-
-  try {
-    // Step 1: Clone the element
-    const clone = element.cloneNode(true) as HTMLElement;
-    clone.style.position = "absolute";
-    clone.style.left = "-9999px";
-    clone.style.top = "0";
-    document.body.appendChild(clone);
-
-    // Step 2: Get all elements and force computed styles
-    const processElement = (original: Element, cloned: Element) => {
-      if (original instanceof HTMLElement && cloned instanceof HTMLElement) {
-        const computed = window.getComputedStyle(original);
-        
-        // List of all color-related properties to override
-        const colorProperties = [
-          'backgroundColor',
-          'color',
-          'borderColor',
-          'borderTopColor',
-          'borderRightColor',
-          'borderBottomColor',
-          'borderLeftColor',
-          'outlineColor',
-        ];
-
-        // Apply computed RGB values to override any oklab/oklch
-        colorProperties.forEach(prop => {
-          const kebabProp = prop.replace(/[A-Z]/g, m => `-${m.toLowerCase()}`);
-          const value = computed.getPropertyValue(kebabProp);
-          
-          if (value && value !== 'rgba(0, 0, 0, 0)' && value !== 'transparent') {
-            cloned.style.setProperty(kebabProp, value, 'important');
-          }
-        });
 import html2canvas from "html2canvas";
+import { logger } from "@/app/utils/logger";
+
+const log = logger.child("imageExport");
 
 const GENERATION_TIMEOUT_MS = 10_000;
 
@@ -203,14 +168,14 @@ async function canvasToBlob(
       const blob = await encodeCanvasInWorker(canvas);
       return { blob, usedWorker: true };
     } catch (error) {
-      console.warn(
+      log.warn(
         "OffscreenCanvas worker encoding failed, falling back to main thread:",
         error,
       );
       options?.onFallbackWarning?.();
     }
   } else {
-    console.warn(
+    log.warn(
       "OffscreenCanvas is not supported in this browser. Using main-thread encoding.",
     );
     options?.onFallbackWarning?.();
@@ -231,6 +196,11 @@ function triggerDownload(blob: Blob, filename: string = "stellar-wrapped-2026.pn
   window.setTimeout(() => URL.revokeObjectURL(url), 100);
 }
 
+export interface RenderedShareImage extends ShareImageExportResult {
+  blob: Blob;
+  filename: string;
+}
+
 /**
  * Downloads the ShareImageCard as a PNG image
  * @param element - The DOM element to capture (ShareImageCard ref)
@@ -240,6 +210,22 @@ export async function downloadShareImage(
   element: HTMLElement,
   options?: ShareImageExportOptions,
 ): Promise<ShareImageExportResult> {
+  const { blob, filename, ...result } = await renderShareImage(element, options);
+  triggerDownload(blob, filename);
+  return result;
+}
+
+/** Saves an already rendered share image to the user's device. */
+export { triggerDownload as downloadImageBlob };
+
+/**
+ * Renders the ShareImageCard to a PNG blob without downloading it.
+ * Throws when canvas reads are blocked (tainted canvas, private mode) or on timeout.
+ */
+export async function renderShareImage(
+  element: HTMLElement,
+  options?: ShareImageExportOptions,
+): Promise<RenderedShareImage> {
   const startTime = performance.now();
   const scale = getCaptureScale();
   const format = options?.format || "square";
@@ -274,9 +260,10 @@ export async function downloadShareImage(
         });
 
         const { blob, usedWorker } = await canvasToBlob(canvas, options);
-        triggerDownload(blob, filename);
 
         return {
+          blob,
+          filename,
           usedWorker,
           scale,
           durationMs: Math.round(performance.now() - startTime),

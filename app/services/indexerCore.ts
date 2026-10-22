@@ -1,5 +1,12 @@
 /**
  * Server-safe Horizon indexing core (no IndexedDB / browser globals).
+ *
+ * Indexer layering:
+ * - core:      this module — fetches Horizon history and computes the result.
+ * - transport: `indexAccount` from `indexerService` (browser, IndexedDB cache)
+ *              or `indexerServer` (API routes, always live). Callers use these,
+ *              never the core directly.
+ * - multiTimeframeIndexer runs the browser transport across several periods.
  */
 
 import { getHorizonServer } from "@/app/utils/stellarClient";
@@ -32,6 +39,7 @@ import {
   WrapPeriod,
 } from "@/app/utils/indexer";
 import { calculateAchievements } from "./achievementCalculator";
+import { ConcurrencyManager, throwIfAborted } from "./concurrencyManager";
 import { IndexerEventEmitter } from "@/app/utils/indexerEventEmitter";
 import { INDEXING_STEPS, IndexingStep } from "@/app/types/indexing";
 import {
@@ -40,38 +48,24 @@ import {
 } from "@/app/utils/indexingAbort";
 import { indexerError } from "@/app/utils/indexerDebug";
 
-const MAX_CONCURRENT_REQUESTS = 5;
-
-interface QueueItem {
-  cursor?: string;
-  resolve: () => void;
-  reject: () => void;
-}
-
-class ConcurrencyManager {
-  private active = 0;
-  private queue: QueueItem[] = [];
-
-  async run<T>(fn: () => Promise<T>): Promise<T> {
-    while (this.active >= MAX_CONCURRENT_REQUESTS) {
-      await new Promise<void>((resolve) => {
-        this.queue.push({
-          resolve: () => resolve(),
-          reject: () => {},
-        });
-      });
-    }
-
-    this.active++;
-    try {
-      return await fn();
-    } finally {
-      this.active--;
-      const next = this.queue.shift();
-      if (next) {
-        next.resolve();
-      }
-    }
+/**
+ * Structured error that preserves the HTTP status code and type from Horizon.
+ * Thrown instead of plain Error so callers (e.g. /api/wrapped) can branch
+ * on `statusCode` without parsing message strings.
+ */
+export class HorizonError extends Error {
+  constructor(
+    message: string,
+    public readonly statusCode: number,
+    public readonly errorType:
+      | "not_found"
+      | "rate_limited"
+      | "server_error"
+      | "timeout"
+      | "unknown",
+  ) {
+    super(message);
+    this.name = "HorizonError";
   }
 }
 
@@ -111,19 +105,24 @@ async function animateStep<T>(
 
 /**
  * Internal: run full Horizon indexing. When background is true, no step events are emitted.
+ * Returns both the computed result and the raw transactions within the period,
+ * so callers can derive narrower timeframes from the wider fetch.
  */
 export async function runIndexingCore(
   accountId: string,
   network: "mainnet" | "testnet",
   period: WrapPeriod,
   background: boolean,
-): Promise<IndexerResult> {
+): Promise<{ result: IndexerResult; transactions: unknown[] }> {
   const emitter = IndexerEventEmitter.getInstance();
   const server = getHorizonServer(network);
   const days = PERIODS[period];
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - days);
 
+  // Captured once: abortIndexingRequests() clears the shared controller, so
+  // re-reading it mid-run would miss the cancellation.
+  const runSignal = getIndexingAbortSignal();
   let currentEmittedStep: IndexingStep = "initializing";
 
   const emit = (fn: () => void) => {
@@ -142,6 +141,7 @@ export async function runIndexingCore(
     emit(() => emitter.emitStepChange("fetching-transactions"));
 
     const allTransactions: unknown[] = [];
+    const seenTokens = new Set<string>();
     const fetchDuration =
       INDEXING_STEPS["fetching-transactions"].estimatedDuration;
     const fetchStart = Date.now();
@@ -152,10 +152,7 @@ export async function runIndexingCore(
     let totalEstimatedTotal: number | null = null;
 
     while (hasMore) {
-      const signal = getIndexingAbortSignal();
-      if (signal?.aborted) {
-        throw new DOMException("Indexing cancelled", "AbortError");
-      }
+      throwIfAborted(runSignal);
 
       let response: unknown;
       try {
@@ -174,7 +171,7 @@ export async function runIndexingCore(
             builder.cursor(cursor);
           }
           return builder.call();
-        });
+        }, runSignal);
       } catch (error: unknown) {
         if (isAbortError(error)) {
           throw new DOMException("Indexing cancelled", "AbortError");
@@ -186,20 +183,38 @@ export async function runIndexingCore(
           message?: string;
         };
         if (errorObj?.response?.status === 404) {
-          throw new Error("Account not found (404). Please check the address.");
+          throw new HorizonError(
+            "Account not found (404). Please check the address.",
+            404,
+            "not_found",
+          );
         } else if (errorObj?.response?.status === 429) {
-          throw new Error("Rate limit exceeded (429). Please try again later.");
+          throw new HorizonError(
+            "Rate limit exceeded (429). Please try again later.",
+            429,
+            "rate_limited",
+          );
         } else if (errorObj?.response?.status === 500) {
-          throw new Error("Server error (500). Please try again later.");
+          throw new HorizonError(
+            "Server error (500). Please try again later.",
+            500,
+            "server_error",
+          );
         } else if (
           errorObj?.code === "ECONNABORTED" ||
           errorObj?.name === "TimeoutError"
         ) {
-          throw new Error("Network timeout. Please check your connection.");
+          throw new HorizonError(
+            "Network timeout. Please check your connection.",
+            408,
+            "timeout",
+          );
         } else {
-          throw new Error(
+          throw new HorizonError(
             "Unknown error fetching transactions: " +
               (errorObj?.message || String(error)),
+            500,
+            "unknown",
           );
         }
       }
@@ -240,10 +255,17 @@ export async function runIndexingCore(
           };
         }),
       );
+      throwIfAborted(runSignal);
       const recordsInRange = recordsWithOps.filter((tx: TransactionRecord) => {
         return new Date(tx.created_at) >= cutoffDate;
       });
-      allTransactions.push(...recordsInRange);
+      for (const tx of recordsInRange) {
+        const key = String(tx.paging_token ?? (tx as Record<string, unknown>).hash ?? "");
+        if (!key || !seenTokens.has(key)) {
+          if (key) seenTokens.add(key);
+          allTransactions.push(tx);
+        }
+      }
 
       // Emit metrics update - transaction count
       emit(() =>
@@ -403,8 +425,11 @@ export async function runIndexingCore(
       return r;
     }, background);
 
+    // Cancellation may land between the last fetch and here; never hand a
+    // cancelled run's result to callers that would store it.
+    throwIfAborted(runSignal);
     emit(() => emitter.emitIndexingComplete(result));
-    return result;
+    return { result, transactions: allTransactions };
   } catch (error) {
     if (isAbortError(error)) {
       throw error;

@@ -9,7 +9,7 @@
  */
 
 import type { AchievementCalculator } from '../types';
-import type { IndexedTransaction } from '../../indexer/types';
+import type { IndexedTransaction } from '../horizonTypes';
 import {
   createMockPaymentOperation,
   createMockExtendFootprintOperation,
@@ -29,7 +29,8 @@ import {
 
 // Mock implementation placeholder - will be replaced with actual service
 // This allows tests to be written before implementation
-let achievementCalculator: AchievementCalculator;
+let achievementCalculator!: AchievementCalculator;
+
 
 describe('AchievementCalculator', () => {
   beforeEach(() => {
